@@ -1,0 +1,91 @@
+# Baseline: single Qwen3.5-27B agent (no pipeline, no small model)
+# Used as the control group to compare against config/pipeline_qwen.yaml.
+#
+# This configuration mirrors the pipeline's *coding* phase but uses the large
+# model (27B) for everything, with the same call limit budget as the pipeline
+# total (planning 40 + coding 60 = 100 calls).
+#
+# Prerequisites:
+#   - Qwen3.5-27B served via SGLang at http://localhost:30001/v1
+#
+# Usage:
+#   sweagent run-single --config config/baseline_qwen27b.yaml \
+#     --env.repo.github_url=<url> --problem_statement.text="<issue>"
+#
+# For SWE-bench evaluation:
+#   sweagent run-batch --num_workers=4 \
+#     --instances.type=swe_bench --instances.subset=lite --instances.split=test \
+#     --instances.shuffle=True --instances.evaluate=True \
+#     --instances.deployment.docker_args='--memory=10g' \
+#     --config config/baseline_qwen27b.yaml
+
+agent:
+  type: default
+  model:
+    name: openai//models/Qwen/Qwen3.5-27B/
+    api_base: http://localhost:30001/v1
+    api_key: EMPTY
+    max_input_tokens: 32768
+    max_output_tokens: 8192
+    per_instance_cost_limit: 0
+    per_instance_call_limit: 100
+    total_cost_limit: 0
+    temperature: 0.0
+  templates:
+    system_template: |-
+      You are a helpful assistant that can interact with a computer to solve tasks.
+    instance_template: |-
+      <uploaded_files>
+      {{working_dir}}
+      </uploaded_files>
+      I've uploaded a python code repository in the directory {{working_dir}}. Consider the following issue:
+
+      <issue>
+      {{problem_statement}}
+      </issue>
+
+      I've already taken care of all changes to any of the test files described in the issue.
+      This means you DON'T have to modify the testing logic or any of the tests in any way!
+
+      Your task is to make the minimal changes to non-tests files in the {{working_dir}} directory to ensure the issue is satisfied.
+      Follow these steps to resolve the issue:
+      1. As a first step, find and read code relevant to the issue
+      2. Create a script to reproduce the error and execute it with `python <filename.py>` using the bash tool, to confirm the error
+      3. Edit the sourcecode of the repo to resolve the issue
+      4. Rerun your reproduce script and confirm that the error is fixed!
+      5. Think about edgecases and make sure your fix handles them as well
+      Your thinking should be thorough and so it's fine if it's very long.
+    next_step_template: |-
+      OBSERVATION:
+      {{observation}}
+    next_step_no_output_template: |-
+      Your command ran successfully and did not produce any output.
+  tools:
+    execution_timeout: 300
+    bundles:
+      - path: tools/registry
+      - path: tools/edit_anthropic
+      - path: tools/review_on_submit_m
+      - path: tools/diff_state
+    enable_bash_tool: true
+    parse_function:
+      type: thought_action
+    registry_variables:
+      USE_FILEMAP: 'true'
+      SUBMIT_REVIEW_MESSAGES:
+        - |
+          Please review your changes before final submission:
+
+          1. If you created a reproduction script, run it again to confirm the fix.
+          2. Remove any reproduction scripts.
+          3. If you modified any TEST files, revert them with `git checkout -- /path/to/test/file.py`.
+          4. Run submit again to confirm.
+
+          Your changes:
+
+          <diff>
+          {{diff}}
+          </diff>
+  history_processors:
+    - type: cache_control
+      last_n_messages: 2

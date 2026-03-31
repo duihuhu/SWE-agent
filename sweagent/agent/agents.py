@@ -193,7 +193,74 @@ class RetryAgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-AgentConfig = Annotated[DefaultAgentConfig | RetryAgentConfig | ShellAgentConfig, Field(union_mode="left_to_right")]
+class VerificationConfig(BaseModel):
+    """Configuration for the verification phase of the pipeline agent."""
+
+    model: ModelConfig
+    system_template: str = (
+        "You are an expert software engineer reviewing a code patch. "
+        "You will be given a problem statement, a plan, and a code patch. "
+        "Evaluate whether the patch correctly solves the problem described."
+    )
+    instance_template: str = (
+        "Problem statement:\n{{problem_statement}}\n\n"
+        "Plan:\n{{plan}}\n\n"
+        "Patch:\n```\n{{submission}}\n```\n\n"
+        "{% if edited_files30 != 'Empty. No edited files found.' %}"
+        "Edited files with context:\n```\n{{edited_files30}}\n```\n\n"
+        "{% endif %}"
+        "Please review the patch carefully:\n"
+        "1. Does it correctly address the problem?\n"
+        "2. Are there any bugs or edge cases not handled?\n"
+        "3. Is it consistent with the codebase conventions?\n\n"
+        "Provide a score from 0-10 (10 = perfect) on the last line.\n"
+        "The acceptance threshold is {{accept_score}}. "
+        "If the score is below {{accept_score}}, provide specific "
+        "feedback on what needs to be fixed."
+    )
+    n_samples: int = 1
+    """Number of verification samples to average over."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PipelineAgentConfig(BaseModel):
+    """Configuration for the pipeline agent that orchestrates planning, coding, and verification.
+
+    Phase 1 (Planning): A large model retrieves relevant code and creates a plan.
+    Phase 2 (Coding): A small model generates code based on the plan.
+    Phase 3 (Verification): A large model reviews the patch and provides feedback.
+    If verification fails, Phase 2 is retried with the feedback.
+    """
+
+    type: Literal["pipeline"] = "pipeline"
+    name: str = "pipeline_main"
+
+    planning_agent: DefaultAgentConfig
+    """Agent config for Phase 1 (Planning): uses a large model for code retrieval and planning."""
+
+    coding_agent: DefaultAgentConfig
+    """Agent config for Phase 2 (Coding): uses a small model for code generation."""
+
+    verification: VerificationConfig
+    """Config for Phase 3 (Verification): uses a large model to review the patch."""
+
+    max_verification_retries: int = 3
+    """Maximum number of coding+verification cycles before accepting the best result."""
+
+    accept_score: float = 7.0
+    """Minimum verification score to accept a submission without retrying."""
+
+    cost_limit: float = 5.0
+    """Total cost limit across all phases."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+AgentConfig = Annotated[
+    DefaultAgentConfig | RetryAgentConfig | ShellAgentConfig | PipelineAgentConfig,
+    Field(union_mode="left_to_right"),
+]
 
 
 class _BlockedActionError(Exception):
@@ -245,10 +312,13 @@ def get_agent_from_config(config: AgentConfig) -> AbstractAgent:
     elif config.type == "retry":
         return RetryAgent.from_config(config)
     elif config.type == "shell":
-        # Need to defer import to avoid circular dependency
         from sweagent.agent.extra.shell_agent import ShellAgent
 
         return ShellAgent.from_config(config)
+    elif config.type == "pipeline":
+        from sweagent.agent.extra.pipeline_agent import PipelineAgent
+
+        return PipelineAgent.from_config(config)
     else:
         msg = f"Unknown agent type: {config.type}"
         raise ValueError(msg)

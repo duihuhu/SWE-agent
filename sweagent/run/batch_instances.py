@@ -2,6 +2,8 @@ import json
 import os
 import random
 import re
+import shlex
+import hashlib
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Literal
@@ -304,6 +306,22 @@ class SWEBenchInstances(BaseModel, AbstractInstanceSource):
     evaluate: bool = False
     """Run sb-cli to evaluate"""
 
+    post_startup_commands: list[str] = []
+    """Additional commands executed in every instance environment after startup."""
+
+    post_startup_command_timeout: int = 500
+    """Timeout for each post-startup command."""
+
+    reference_repos: list[str] = []
+    """Reference repositories to make available in container for planning.
+    Supports:
+    - Remote git URL (https://... or git@...)
+    - Absolute in-container local path (/root/...)
+    """
+
+    reference_repo_root: str = "/root/reference_repos"
+    """Directory where reference repositories are exposed to the agent."""
+
     def _get_dataset_path(self) -> str:
         if self.path_override is not None:
             return str(self.path_override)
@@ -332,7 +350,60 @@ class SWEBenchInstances(BaseModel, AbstractInstanceSource):
         instances = [
             SimpleBatchInstance.from_swe_bench(instance).to_full_batch_instance(self.deployment) for instance in ds
         ]
+        self._attach_extra_environment_context(instances)
         return _filter_batch_items(instances, filter_=self.filter, slice_=self.slice, shuffle=self.shuffle)
+
+    @staticmethod
+    def _sanitize_repo_name(repo_ref: str, idx: int) -> str:
+        candidate = repo_ref.rstrip("/").split("/")[-1]
+        if not candidate:
+            candidate = f"ref_{idx}"
+        candidate = candidate.replace(".git", "")
+        candidate = re.sub(r"[^a-zA-Z0-9._-]", "_", candidate)
+        if not candidate:
+            candidate = f"ref_{idx}"
+        suffix = hashlib.sha1(repo_ref.encode("utf-8")).hexdigest()[:8]
+        return f"{candidate}_{suffix}"
+
+    def _build_reference_repo_commands(self) -> list[str]:
+        if not self.reference_repos:
+            return []
+        root = self.reference_repo_root.rstrip("/") or "/root/reference_repos"
+        commands = [f"mkdir -p {shlex.quote(root)}"]
+        for idx, repo_ref in enumerate(self.reference_repos):
+            repo_name = self._sanitize_repo_name(repo_ref, idx)
+            target = f"{root}/{repo_name}"
+            q_target = shlex.quote(target)
+            q_ref = shlex.quote(repo_ref)
+            if repo_ref.startswith("/"):
+                commands.append(
+                    "if [ -d {src} ]; then rm -rf {dst} && ln -s {src} {dst}; "
+                    "else echo 'WARN: local reference path not found: {src}'; fi".format(
+                        src=q_ref,
+                        dst=q_target,
+                    )
+                )
+            else:
+                commands.append(
+                    "if [ -d {dst}/.git ]; then "
+                    "git -C {dst} fetch --depth 1 origin && git -C {dst} reset --hard origin/HEAD; "
+                    "else rm -rf {dst} && git clone --depth 1 {src} {dst}; fi".format(
+                        src=q_ref,
+                        dst=q_target,
+                    )
+                )
+        return commands
+
+    def _attach_extra_environment_context(self, instances: list[BatchInstance]) -> None:
+        ref_commands = self._build_reference_repo_commands()
+        for instance in instances:
+            existing = instance.env.post_startup_commands.copy()
+            instance.env.post_startup_commands = [
+                *existing,
+                *self.post_startup_commands,
+                *ref_commands,
+            ]
+            instance.env.post_startup_command_timeout = self.post_startup_command_timeout
 
     @property
     def id(self) -> str:

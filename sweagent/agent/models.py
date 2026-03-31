@@ -695,7 +695,7 @@ class LiteLLMModel(AbstractModel):
         if self.model_max_input_tokens is None:
             msg = (
                 f"No max input tokens found for model {self.config.name!r}. "
-                "If you are using a local model, you can set `max_input_token` in the model config to override this."
+                "If you are using a local model, you can set `max_input_tokens` in the model config to override this."
             )
             self.logger.warning(msg)
         elif input_tokens > self.model_max_input_tokens > 0:

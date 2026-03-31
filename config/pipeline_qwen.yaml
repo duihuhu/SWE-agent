@@ -1,0 +1,225 @@
+# Pipeline agent configuration: Qwen3.5-27B (planning + verification) + Qwen3.5-9B (coding)
+# Using SGLang as the model serving backend (OpenAI-compatible API).
+#
+# Prerequisites:
+#   - Qwen3.5-9B  served via SGLang at http://localhost:30000/v1
+#   - Qwen3.5-27B served via SGLang at http://localhost:30001/v1
+#
+# Usage:
+#   sweagent run-single --config config/pipeline_qwen.yaml \
+#     --env.repo.github_url=<url> --problem_statement.text="<issue>"
+#
+# Local/OpenAI-compat models are not in litellm's registry: set max_input_tokens so
+# token counting can warn on context overflow (see sweagent LiteLLMModel).
+#
+# For SWE-bench evaluation:
+#   sweagent run-batch --num_workers=4 \
+#     --instances.type=swe_bench --instances.subset=lite --instances.split=test \
+#     --instances.shuffle=True --instances.evaluate=True \
+#     --instances.deployment.docker_args='--memory=10g' \
+#     --config config/pipeline_qwen.yaml
+
+agent:
+  type: pipeline
+
+  # ---------------------------------------------------------------
+  # Phase 1: Planning agent (large model – Qwen3.5-27B @ :30001)
+  # Retrieves relevant code, analyzes the problem, and writes a plan
+  # to /root/plan.md before submitting.
+  # NOTE: Planning agent does NOT need review_on_submit because it
+  # makes no code changes — it only produces a plan file.
+  # ---------------------------------------------------------------
+  planning_agent:
+    type: default
+    model: &large_model
+      name: openai//models/Qwen/Qwen3.5-27B/
+      api_base: http://localhost:30001/v1
+      api_key: EMPTY
+      max_input_tokens: 32768
+      max_output_tokens: 8192
+      per_instance_cost_limit: 0
+      per_instance_call_limit: 40
+      total_cost_limit: 0
+      temperature: 0.0
+    templates:
+      system_template: |-
+        You are an expert software engineer specializing in code analysis and planning.
+        Your job is to understand a codebase and create a detailed plan for fixing an issue.
+        You should NOT make any code changes yourself — only analyze and plan.
+      instance_template: |-
+        <uploaded_files>
+        {{working_dir}}
+        </uploaded_files>
+        I've uploaded a python code repository in the directory {{working_dir}}. Consider the following issue:
+
+        <issue>
+        {{problem_statement}}
+        </issue>
+
+        Your task is to analyze the codebase and create a DETAILED PLAN for fixing this issue.
+        You must NOT edit any source files. Instead:
+
+        1. Use search and file reading tools to understand the relevant code in the primary repository
+        2. If reference repositories are available under /root/reference_repos, read them as supplementary context
+           (do not copy blindly; use them only to improve design decisions)
+        3. Identify the root cause of the issue
+        4. Create a detailed step-by-step plan for the fix
+
+        When you are done analyzing, write your complete plan to /root/plan.md using bash:
+        ```bash
+        cat > /root/plan.md << 'PLAN_EOF'
+        <your detailed plan here>
+        PLAN_EOF
+        ```
+
+        Then run the submit command to finish.
+
+        Your plan should include:
+        - Which files need to be modified and why
+        - What specific changes to make in each file (be precise about line-level changes)
+        - Any edge cases to consider
+        - How to verify the fix works
+      next_step_template: &next_step |-
+        OBSERVATION:
+        {{observation}}
+      next_step_no_output_template: &next_step_no_output |-
+        Your last command ran successfully and did not produce any output.
+    tools:
+      execution_timeout: &execution_timeout 300
+      bundles:
+        - path: tools/registry
+        - path: tools/diff_state
+      enable_bash_tool: true
+      parse_function: &parse_function
+        type: thought_action
+      registry_variables:
+        USE_FILEMAP: 'true'
+    history_processors: &history_processors
+      - type: cache_control
+        last_n_messages: 2
+
+  # ---------------------------------------------------------------
+  # Phase 2: Coding agent (small model – Qwen3.5-9B @ :30000)
+  # Receives the plan and generates code changes accordingly.
+  # ---------------------------------------------------------------
+  coding_agent:
+    type: default
+    model: &small_model
+      name: openai//models/Qwen/Qwen3.5-9B/
+      api_base: http://localhost:30000/v1
+      api_key: EMPTY
+      max_input_tokens: 32768
+      max_output_tokens: 8192
+      per_instance_cost_limit: 0
+      per_instance_call_limit: 60
+      total_cost_limit: 0
+      temperature: 0.0
+    templates:
+      system_template: |-
+        You are a skilled software engineer who implements code changes based on a provided plan.
+        Follow the plan precisely and make minimal, correct changes to resolve the issue.
+      instance_template: |-
+        <uploaded_files>
+        {{working_dir}}
+        </uploaded_files>
+        I've uploaded a python code repository in the directory {{working_dir}}. Consider the following issue:
+
+        <issue>
+        {{problem_statement}}
+        </issue>
+
+        I've already taken care of all changes to any of the test files described in the issue.
+        This means you DON'T have to modify the testing logic or any of the tests in any way!
+
+        A detailed plan has been prepared for you by a senior engineer. Follow it carefully to implement the fix:
+
+        1. Read the plan below carefully
+        2. Make the code changes described in the plan
+        3. If the plan mentions creating a reproduction script, do so and verify the fix
+        4. Run the submit command when done
+
+        NOTE: The plan will be appended below in a <plan> tag.
+      next_step_template: *next_step
+      next_step_no_output_template: *next_step_no_output
+    tools:
+      execution_timeout: *execution_timeout
+      bundles:
+        - path: tools/registry
+        - path: tools/edit_anthropic
+        - path: tools/review_on_submit_m
+        - path: tools/diff_state
+      enable_bash_tool: true
+      parse_function: *parse_function
+      registry_variables:
+        USE_FILEMAP: 'true'
+        SUBMIT_REVIEW_MESSAGES:
+          - |
+            Please review your changes before final submission:
+
+            1. If you created a reproduction script, run it again to confirm the fix.
+            2. Remove any reproduction scripts.
+            3. If you modified any TEST files, revert them with `git checkout -- /path/to/test/file.py`.
+            4. Run submit again to confirm.
+
+            Your changes:
+
+            <diff>
+            {{diff}}
+            </diff>
+    history_processors: *history_processors
+
+  # ---------------------------------------------------------------
+  # Phase 3: Verification (large model – Qwen3.5-27B @ :30001)
+  # Reviews the generated patch and provides feedback.
+  # ---------------------------------------------------------------
+  verification:
+    model:
+      name: openai//models/Qwen/Qwen3.5-27B/
+      api_base: http://localhost:30001/v1
+      api_key: EMPTY
+      max_input_tokens: 32768
+      max_output_tokens: 8192
+      per_instance_cost_limit: 0
+      total_cost_limit: 0
+      temperature: 0.0
+    system_template: |-
+      You are an expert software engineer reviewing a code patch.
+      You will be given a problem statement, a plan, and a code patch.
+      Evaluate whether the patch correctly and completely solves the problem.
+    instance_template: |-
+      Problem statement:
+      {{problem_statement}}
+
+      Plan:
+      {{plan}}
+
+      Submitted patch:
+      ```
+      {{submission}}
+      ```
+
+      {% if edited_files30 != 'Empty. No edited files found.' %}
+      Edited files with surrounding context:
+      ```
+      {{edited_files30}}
+      ```
+      {% endif %}
+
+      Please review the patch carefully:
+      1. Does it correctly address the root cause of the problem?
+      2. Are there any bugs, typos, or logical errors?
+      3. Are edge cases handled properly?
+      4. Is it consistent with the codebase style and conventions?
+      5. Are there any unnecessary changes (e.g., test modifications)?
+
+      If there are issues, describe them specifically so they can be fixed.
+
+      The acceptance threshold is {{accept_score}}. On the last line, provide a score from 0 to 10
+      (10 = perfect fix, 0 = completely wrong). If your score is below {{accept_score}}, your
+      feedback will be sent back to the developer for revision.
+    n_samples: 1
+
+  # Pipeline parameters
+  max_verification_retries: 3
+  accept_score: 7.0
+  cost_limit: 0
